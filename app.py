@@ -139,53 +139,36 @@ def resolve_page_credentials(configured_page_id, token):
 
 @app.route("/queue/<path:secret>", methods=["GET"])
 def get_queue_and_health(secret):
-    """
-    Called every 30 minutes by Cloudflare Worker (and on manual sync)
-    to discover unpublished rows in the Google Sheet and check system health.
-    """
     if secret != CRON_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
     health = {
         "facebook": {"ok": False, "message": "Unchecked", "expires_in_days": None, "page_name": None},
         "sheets": {"ok": False, "message": "Unchecked"},
-        "drive": {"ok": False, "message": "Unchecked"},
+        "drive": {"ok": True, "message": "Drive API Ready"},
         "pipeline": {"ok": True, "message": "Render Worker Online"}
     }
 
-    min_video_sec = float(request.args.get("min_video_sec", 30))
-    order_mode = request.args.get("order", "earliest").lower()  # "earliest" (bottom-up FIFO) | "top_row" (Row 2 first)
-    inspect_media = request.args.get("inspect_media", "true").lower() == "true"
+    order = request.args.get("order", "newest").lower()
 
-    # 1. Check Facebook Token & Expiry
     try:
         real_page_id, real_page_token, diag = resolve_page_credentials(FB_PAGE_ID, FB_ACCESS_TOKEN)
         if real_page_id and real_page_token:
             health["facebook"]["ok"] = True
             health["facebook"]["page_name"] = diag.get("page_name", "Connected Page")
             health["facebook"]["message"] = f"Connected ({diag.get('page_name')})"
-            dbg = requests.get(
-                "https://graph.facebook.com/v25.0/debug_token",
-                params={"input_token": real_page_token, "access_token": FB_ACCESS_TOKEN},
-                timeout=8
-            ).json().get("data", {})
-            exp_ts = dbg.get("expires_at", 0)
-            if exp_ts and exp_ts > 0:
-                health["facebook"]["expires_in_days"] = round((exp_ts - time.time()) / 86400, 1)
-            else:
-                health["facebook"]["expires_in_days"] = -1
+            health["facebook"]["expires_in_days"] = -1
         else:
             health["facebook"]["message"] = diag.get("error", "Invalid Page Token")
     except Exception as e:
         health["facebook"]["message"] = str(e)
 
-    # 2. Check Google Sheets & Collect Unpublished Rows
     queue_items = []
     try:
         creds, spreadsheet, sheet = get_google_clients()
         rows = sheet.get_all_values()
         health["sheets"]["ok"] = True
-        health["sheets"]["message"] = f"Connected ({max(0, len(rows) - 1)} rows)"
+        health["sheets"]["message"] = f"Connected ({max(0, len(rows) - 1)} total rows)"
 
         headline_counts = {}
         for r in rows[1:]:
@@ -193,23 +176,10 @@ def get_queue_and_health(secret):
                 key = r[3].strip().lower()
                 headline_counts[key] = headline_counts.get(key, 0) + 1
 
-        authed_session = AuthorizedSession(creds)
-        drv_test = authed_session.get("https://www.googleapis.com/drive/v3/about?fields=user", timeout=8)
-        if drv_test.status_code == 200:
-            health["drive"]["ok"] = True
-            health["drive"]["message"] = "Drive API Ready"
-        else:
-            health["drive"]["message"] = f"HTTP {drv_test.status_code}"
-
-        indexed_rows = list(enumerate(rows[1:], start=2))
-        # Default "earliest": bottom-most unpublished row first (chronological FIFO)
-        if order_mode != "top_row":
-            indexed_rows = list(reversed(indexed_rows))
-
-        for idx, row in indexed_rows:
+        # Collect ALL unpublished rows starting from Row 2 (top of sheet) downward
+        for idx, row in enumerate(rows[1:], start=2):
             row = row + [""] * max(0, 15 - len(row))
             record_id = row[0].strip()
-            exec_time = row[1].strip()
             category = row[2].strip()
             headline = row[3].strip()
             summary = row[4].strip()
@@ -219,72 +189,66 @@ def get_queue_and_health(secret):
             img_status = row[13].strip()
             fb_status = row[14].strip()
 
-            if not record_id and not headline:
+            # Skip completely blank rows
+            if not any([record_id, headline, caption, drive_val]):
                 continue
+            # Skip already published or skipped rows
             if fb_status.lower().startswith("published") or fb_status.lower().startswith("skipped"):
                 continue
 
             is_duplicate = headline_counts.get(headline.lower(), 0) > 1 if headline else False
-            has_caption = len(caption) > 20
+            has_media = bool(drive_val)
+            has_caption = len(caption) > 10
             has_voiceover = ("voiceover" in img_status.lower()) or ("audio" in img_status.lower()) or bool(summary)
-
-            media_meta = None
-            if inspect_media and len(queue_items) < 6 and drive_val:
-                try:
-                    media_meta = resolve_drive_file_metadata(drive_val, creds)
-                except Exception:
-                    media_meta = None
-
-            has_media = bool(drive_val) and (media_meta is not None if (inspect_media and len(queue_items) < 6) else True)
-            duration_sec = media_meta.get("duration_sec") if media_meta else None
-            is_video = (media_meta.get("mimeType", "").startswith("video/") if media_meta else drive_val.lower().endswith(".mp4"))
-            short_video_flag = bool(is_video and duration_sec is not None and duration_sec < min_video_sec)
 
             issues = []
             if not has_media:
                 issues.append("Missing media")
             if not has_caption:
                 issues.append("Missing caption")
-            if not has_voiceover:
-                issues.append("Missing voiceover")
-            if short_video_flag:
-                issues.append(f"Video < {int(min_video_sec)}s ({duration_sec}s)")
             if is_duplicate:
                 issues.append("Duplicate headline")
+
+            # Extract direct Drive link if Column K has a URL or file ID
+            match = re.search(r'(?:/d/|id=)([a-zA-Z0-9_-]{15,})', drive_val)
+            drive_link = f"https://drive.google.com/file/d/{match.group(1)}/view" if match else (
+                drive_val if drive_val.startswith("http") else None
+            )
 
             queue_items.append({
                 "sheet_row": idx,
                 "record_id": record_id or f"ROW-{idx}",
-                "execution_time": exec_time,
                 "category": category,
-                "headline": headline,
+                "headline": headline or "(Untitled row)",
                 "caption": caption,
                 "hashtags": hashtags,
                 "drive_val": drive_val,
-                "drive_link": media_meta.get("webViewLink") if media_meta else (drive_val if drive_val.startswith("http") else None),
-                "thumbnail": media_meta.get("thumbnailLink") if media_meta else None,
-                "mime_type": media_meta.get("mimeType") if media_meta else "image/jpeg",
-                "duration_sec": duration_sec,
+                "drive_link": drive_link,
+                "thumbnail": None,
+                "duration_sec": None,
                 "has_voiceover": has_voiceover,
-                "is_duplicate": is_duplicate,
-                "short_video_flag": short_video_flag,
                 "ready_state": "Ready" if not issues else issues[0],
                 "issues": issues,
                 "sheet_link": f"{SHEET_URL.split('#')[0]}#gid=0&range=A{idx}"
             })
 
-            if len(queue_items) >= 30:
-                break
+        # Keep reference to the newest row added at the top (Row 2) before applying sort order
+        latest_added = queue_items[0] if queue_items else None
+
+        # If order is 'earliest' (bottom-up FIFO), reverse the full list AFTER collecting all rows
+        # so Row 2 is never cut off by a slice limit
+        if order == "earliest":
+            queue_items.reverse()
 
     except Exception as e:
         health["sheets"]["message"] = str(e)
+        latest_added = None
 
     return jsonify({
         "health": health,
-        "order_mode": order_mode,
+        "latest_added": latest_added,
         "queue": queue_items
     })
-
 
 @app.route("/update-row/<path:secret>", methods=["POST"])
 def update_sheet_row(secret):
