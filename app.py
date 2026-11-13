@@ -44,14 +44,42 @@ def log_to_cloudflare(record_id, headline, status, fb_post_id=None, details="", 
         pass
 
 
-def get_drive_direct_bytes(drive_url, creds):
-    """Extracts the Google Drive file ID from Column K and downloads the image bytes."""
-    match = re.search(r'/d/([a-zA-Z0-9_-]+)', drive_url)
-    if not match:
-        raise ValueError(f"Invalid Google Drive URL in Column K: {drive_url}")
-    file_id = match.group(1)
-
+def get_drive_direct_bytes(drive_val, creds):
+    """
+    Accepts EITHER a Google Drive URL (/d/FILE_ID or ?id=FILE_ID)
+    OR an image filename (e.g., VXOQA_FB_Post_...jpg) and downloads the image bytes.
+    """
     authed_session = AuthorizedSession(creds)
+    drive_val = drive_val.strip()
+
+    # 1. Try extracting File ID from a standard Google Drive URL
+    match = re.search(r'(?:/d/|id=)([a-zA-Z0-9_-]{15,})', drive_val)
+    if match:
+        file_id = match.group(1)
+    else:
+        # 2. Treat Column K value as a filename and search Google Drive API for it
+        safe_name = drive_val.replace("'", "\\'")
+        search_url = "https://www.googleapis.com/drive/v3/files"
+        params = {
+            "q": f"name = '{safe_name}' and trashed = false",
+            "fields": "files(id, name)",
+            "pageSize": 1,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true"
+        }
+        search_res = authed_session.get(search_url, params=params)
+        if search_res.status_code != 200:
+            raise RuntimeError(f"Drive search failed (HTTP {search_res.status_code}): {search_res.text}")
+
+        files = search_res.json().get("files", [])
+        if not files:
+            raise ValueError(
+                f"Image file '{drive_val}' not found in Google Drive. "
+                "Make sure your 'VXOQA | Facebook Post Images' folder is shared with your Service Account email."
+            )
+        file_id = files[0]["id"]
+
+    # 3. Download binary image content by file_id
     download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
     response = authed_session.get(download_url)
     if response.status_code != 200:
@@ -60,20 +88,14 @@ def get_drive_direct_bytes(drive_url, creds):
 
 
 def resolve_page_credentials(configured_page_id, token):
-    """
-    Checks if the token is already a Page Token or a User Token.
-    If it is a User Token, automatically retrieves the Page ID and Page Access Token from /me/accounts.
-    """
     me_res = requests.get(
         "https://graph.facebook.com/v25.0/me",
         params={"fields": "id,name,category", "access_token": token}
     ).json()
 
-    # If 'category' is returned, the token is already a Page Access Token
     if "category" in me_res:
         return me_res["id"], token, {"token_type": "Page Token", "page_name": me_res.get("name")}
 
-    # Otherwise, query /me/accounts to extract the Page Access Token
     accounts_res = requests.get(
         "https://graph.facebook.com/v25.0/me/accounts",
         params={"fields": "id,name,access_token,tasks", "access_token": token}
@@ -98,7 +120,6 @@ def post_next_row(secret):
         return jsonify({"error": "Unauthorized - CRON_SECRET does not match"}), 403
 
     try:
-        # 1. Verify Environment Variables
         missing_vars = [
             name for name, val in [
                 ("FB_PAGE_ID", FB_PAGE_ID),
@@ -110,13 +131,11 @@ def post_next_row(secret):
         if missing_vars:
             return jsonify({"error": "Missing Render Environment Variables", "missing": missing_vars}), 400
 
-        # 2. Resolve Facebook Page ID and Page Token
         real_page_id, real_page_token, token_diag = resolve_page_credentials(FB_PAGE_ID, FB_ACCESS_TOKEN)
         if not real_page_id or not real_page_token:
             log_to_cloudflare("N/A", "Token Check", "token_error", details=json.dumps(token_diag))
             return jsonify({"status": "facebook_token_setup_incomplete", "diagnostic": token_diag}), 400
 
-        # 3. Authenticate Google Sheets & Drive API
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.readonly"
@@ -136,25 +155,22 @@ def post_next_row(secret):
 
         rows = sheet.get_all_values()
 
-        # 4. Iterate strictly from Row 2 (newest top row) downward
+        # Iterate strictly from Row 2 (newest top row) downward
         for idx, row in enumerate(rows[1:], start=2):
-            # Pad row so trailing blank cells never skip a valid row
             row = row + [""] * max(0, 15 - len(row))
 
             record_id = row[0].strip()      # Column A: Record ID
             headline = row[3].strip()       # Column D: News Headline
-            drive_img_url = row[10].strip() # Column K: Final Facebook Image
+            drive_img_url = row[10].strip() # Column K: Final Facebook Image (URL or Filename)
             caption = row[11].strip()       # Column L: Facebook Caption
             hashtags = row[12].strip()      # Column M: Hashtags
             fb_status = row[14].strip()     # Column O: Facebook Publishing Status
 
-            # Skip if row has no image/caption or is already marked Published
             if not drive_img_url or not caption:
                 continue
             if fb_status.lower().startswith("published"):
                 continue
 
-            # 5. Download image from Google Drive and post to Facebook Page
             full_message = f"{caption}\n\n{hashtags}".strip()
             img_bytes = get_drive_direct_bytes(drive_img_url, creds)
 
@@ -169,7 +185,6 @@ def post_next_row(secret):
             fb_data = fb_res.json()
 
             if fb_res.status_code == 200 and "id" in fb_data:
-                # Re-verify the exact row number by Record ID (Column A) in case a new row was inserted at Row 2 mid-run
                 target_row = idx
                 if record_id:
                     try:
