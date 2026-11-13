@@ -56,10 +56,6 @@ def log_to_cloudflare(payload):
 
 
 def resolve_drive_file_metadata(drive_val, creds):
-    """
-    Finds the Google Drive file by URL or filename and returns its metadata
-    (id, name, mimeType, thumbnailLink, webViewLink, duration_sec).
-    """
     authed_session = AuthorizedSession(creds)
     drive_val = (drive_val or "").strip()
     if not drive_val:
@@ -143,7 +139,10 @@ def resolve_page_credentials(configured_page_id, token):
 
 @app.route("/queue/<path:secret>", methods=["GET"])
 def get_queue_and_health(secret):
-    """Returns upcoming queue rows, content quality checks, and system health lights."""
+    """
+    Called every 30 minutes by Cloudflare Worker (and on manual sync)
+    to discover unpublished rows in the Google Sheet and check system health.
+    """
     if secret != CRON_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -155,6 +154,7 @@ def get_queue_and_health(secret):
     }
 
     min_video_sec = float(request.args.get("min_video_sec", 30))
+    order_mode = request.args.get("order", "earliest").lower()  # "earliest" (bottom-up FIFO) | "top_row" (Row 2 first)
     inspect_media = request.args.get("inspect_media", "true").lower() == "true"
 
     # 1. Check Facebook Token & Expiry
@@ -164,7 +164,6 @@ def get_queue_and_health(secret):
             health["facebook"]["ok"] = True
             health["facebook"]["page_name"] = diag.get("page_name", "Connected Page")
             health["facebook"]["message"] = f"Connected ({diag.get('page_name')})"
-            # Check token expiry via debug_token
             dbg = requests.get(
                 "https://graph.facebook.com/v25.0/debug_token",
                 params={"input_token": real_page_token, "access_token": FB_ACCESS_TOKEN},
@@ -172,31 +171,28 @@ def get_queue_and_health(secret):
             ).json().get("data", {})
             exp_ts = dbg.get("expires_at", 0)
             if exp_ts and exp_ts > 0:
-                days_left = round((exp_ts - time.time()) / 86400, 1)
-                health["facebook"]["expires_in_days"] = days_left
+                health["facebook"]["expires_in_days"] = round((exp_ts - time.time()) / 86400, 1)
             else:
-                health["facebook"]["expires_in_days"] = -1  # Never expires (Permanent token)
+                health["facebook"]["expires_in_days"] = -1
         else:
             health["facebook"]["message"] = diag.get("error", "Invalid Page Token")
     except Exception as e:
         health["facebook"]["message"] = str(e)
 
-    # 2. Check Google Sheets & Build Queue with Content Quality Checks
+    # 2. Check Google Sheets & Collect Unpublished Rows
     queue_items = []
     try:
         creds, spreadsheet, sheet = get_google_clients()
         rows = sheet.get_all_values()
         health["sheets"]["ok"] = True
-        health["sheets"]["message"] = f"Connected ({len(rows) - 1} total rows)"
+        health["sheets"]["message"] = f"Connected ({max(0, len(rows) - 1)} rows)"
 
-        # Track seen headlines across entire sheet to flag duplicates
         headline_counts = {}
         for r in rows[1:]:
             if len(r) > 3 and r[3].strip():
                 key = r[3].strip().lower()
                 headline_counts[key] = headline_counts.get(key, 0) + 1
 
-        # Test Drive API connectivity
         authed_session = AuthorizedSession(creds)
         drv_test = authed_session.get("https://www.googleapis.com/drive/v3/about?fields=user", timeout=8)
         if drv_test.status_code == 200:
@@ -205,14 +201,18 @@ def get_queue_and_health(secret):
         else:
             health["drive"]["message"] = f"HTTP {drv_test.status_code}"
 
-        for idx, row in enumerate(rows[1:], start=2):
+        indexed_rows = list(enumerate(rows[1:], start=2))
+        # Default "earliest": bottom-most unpublished row first (chronological FIFO)
+        if order_mode != "top_row":
+            indexed_rows = list(reversed(indexed_rows))
+
+        for idx, row in indexed_rows:
             row = row + [""] * max(0, 15 - len(row))
             record_id = row[0].strip()
+            exec_time = row[1].strip()
             category = row[2].strip()
             headline = row[3].strip()
             summary = row[4].strip()
-            source_url = row[6].strip()
-            us_relevance = row[9].strip()
             drive_val = row[10].strip()
             caption = row[11].strip()
             hashtags = row[12].strip()
@@ -224,24 +224,22 @@ def get_queue_and_health(secret):
             if fb_status.lower().startswith("published") or fb_status.lower().startswith("skipped"):
                 continue
 
-            # Quality checks
             is_duplicate = headline_counts.get(headline.lower(), 0) > 1 if headline else False
             has_caption = len(caption) > 20
             has_voiceover = ("voiceover" in img_status.lower()) or ("audio" in img_status.lower()) or bool(summary)
 
             media_meta = None
-            if inspect_media and len(queue_items) < 8 and drive_val:
+            if inspect_media and len(queue_items) < 6 and drive_val:
                 try:
                     media_meta = resolve_drive_file_metadata(drive_val, creds)
                 except Exception:
                     media_meta = None
 
-            has_media = bool(drive_val) and (media_meta is not None if (inspect_media and len(queue_items) < 8) else True)
+            has_media = bool(drive_val) and (media_meta is not None if (inspect_media and len(queue_items) < 6) else True)
             duration_sec = media_meta.get("duration_sec") if media_meta else None
             is_video = (media_meta.get("mimeType", "").startswith("video/") if media_meta else drive_val.lower().endswith(".mp4"))
             short_video_flag = bool(is_video and duration_sec is not None and duration_sec < min_video_sec)
 
-            # Determine overall readiness badge
             issues = []
             if not has_media:
                 issues.append("Missing media")
@@ -257,6 +255,7 @@ def get_queue_and_health(secret):
             queue_items.append({
                 "sheet_row": idx,
                 "record_id": record_id or f"ROW-{idx}",
+                "execution_time": exec_time,
                 "category": category,
                 "headline": headline,
                 "caption": caption,
@@ -274,7 +273,7 @@ def get_queue_and_health(secret):
                 "sheet_link": f"{SHEET_URL.split('#')[0]}#gid=0&range=A{idx}"
             })
 
-            if len(queue_items) >= 20:
+            if len(queue_items) >= 30:
                 break
 
     except Exception as e:
@@ -282,20 +281,20 @@ def get_queue_and_health(secret):
 
     return jsonify({
         "health": health,
+        "order_mode": order_mode,
         "queue": queue_items
     })
 
 
 @app.route("/update-row/<path:secret>", methods=["POST"])
 def update_sheet_row(secret):
-    """Allows editing headline/caption, skipping a row, or moving a row in Google Sheets."""
     if secret != CRON_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.get_json(silent=True) or {}
     record_id = data.get("record_id", "").strip()
     sheet_row = data.get("sheet_row")
-    action = data.get("action", "edit")  # "edit" | "skip"
+    action = data.get("action", "edit")
 
     try:
         _, _, sheet = get_google_clients()
@@ -326,7 +325,6 @@ def update_sheet_row(secret):
 
 @app.route("/insights/<path:secret>", methods=["POST"])
 def fetch_post_insights(secret):
-    """Fetches views/reach, reactions, comments, and shares from Facebook Graph API."""
     if secret != CRON_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -355,7 +353,6 @@ def fetch_post_insights(secret):
             comments = res.get("comments", {}).get("summary", {}).get("total_count", 0)
             shares = res.get("shares", {}).get("count", 0)
 
-            # Query post impressions / reach if available
             views = 0
             ins_res = requests.get(
                 f"https://graph.facebook.com/v25.0/{pid}/insights",
@@ -367,7 +364,6 @@ def fetch_post_insights(secret):
                 if vals:
                     views = vals[0].get("value", 0)
 
-            # Estimate views fallback from engagement if Page has < 100 followers insight lock
             if views == 0 and (reactions or comments or shares):
                 views = (reactions * 14) + (comments * 22) + (shares * 35)
 
@@ -391,6 +387,8 @@ def post_next_row(secret):
     trigger_type = request.args.get("trigger", "Manual")
     requested_record_id = request.args.get("record_id", "").strip()
     us_targeting = request.args.get("us_targeting", "true").lower() == "true"
+    # Default to "earliest" (bottom-up chronological FIFO) unless ?order=top_row is passed
+    order_mode = request.args.get("order", "earliest").lower()
 
     try:
         real_page_id, real_page_token, token_diag = resolve_page_credentials(FB_PAGE_ID, FB_ACCESS_TOKEN)
@@ -407,7 +405,13 @@ def post_next_row(secret):
         creds, spreadsheet, sheet = get_google_clients()
         rows = sheet.get_all_values()
 
-        for idx, row in enumerate(rows[1:], start=2):
+        indexed_rows = list(enumerate(rows[1:], start=2))
+        # When order_mode == "earliest" (default), iterate from bottom-most row upward
+        # so the earliest created post (e.g., VXOQA-...-001) is posted before newer posts (e.g., -013)
+        if order_mode != "top_row":
+            indexed_rows = list(reversed(indexed_rows))
+
+        for idx, row in indexed_rows:
             row = row + [""] * max(0, 15 - len(row))
 
             record_id = row[0].strip()
@@ -420,7 +424,6 @@ def post_next_row(secret):
             if not drive_img_url or not caption:
                 continue
 
-            # If a specific record_id was requested (Retry or Queue "Post Now"), match it
             if requested_record_id:
                 if record_id != requested_record_id:
                     continue
@@ -473,10 +476,11 @@ def post_next_row(secret):
                     "drive_link": meta.get("webViewLink"),
                     "thumbnail": meta.get("thumbnailLink"),
                     "duration_sec": meta.get("duration_sec"),
-                    "details": "Published with US Geo-Targeting" if us_targeting else "Published"
+                    "details": f"Published ({order_mode} order)"
                 })
                 return jsonify({
                     "status": "success",
+                    "order_used": order_mode,
                     "trigger": trigger_type,
                     "sheet_row_posted": target_row,
                     "record_id": record_id,
